@@ -14,16 +14,38 @@ import alpaca_trade_api as tradeapi
 import psutil
 
 # ========== SECTION: VOICE ENGINE ==========
-engine = pyttsx3.init()
-engine.setProperty('rate', 175)
-engine.setProperty('volume', 1)
-voices = engine.getProperty('voices')
-engine.setProperty('voice', voices[1].id if len(voices) > 1 else voices[0].id)
+def init_voice_engine():
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 175)
+        engine.setProperty('volume', 1.0)
+        voices = engine.getProperty('voices')
+        if voices and len(voices) > 0:
+            # Try to use a female voice if available
+            for voice in voices:
+                if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
+                    engine.setProperty('voice', voice.id)
+                    break
+            else:
+                engine.setProperty('voice', voices[0].id)
+        print(f"Voice engine initialized successfully")
+        return engine
+    except Exception as e:
+        print(f"Error initializing voice engine: {e}")
+        return None
+
+engine = init_voice_engine()
 
 def speak(text):
     print(f"Harvey: {text}")
-    engine.say(text)
-    engine.runAndWait()
+    if engine:
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print(f"Error speaking: {e}")
+    else:
+        print("Voice engine not available")
 
 # ========== SECTION: BASE HUD CLASS ==========
 class BaseHUD:
@@ -66,11 +88,14 @@ def get_signal(symbol="AAPL"):
     if not api:
         return "HOLD"
     try:
-        # Updated API call - get_barset is deprecated
-        bars = api.get_bars(symbol, '5Min', limit=50).df
-        if bars.empty or len(bars) < 20:
+        # Use yfinance as backup for price data since Alpaca might have issues
+        stock = yf.Ticker(symbol)
+        hist = stock.history(period="5d", interval="5m")
+        if hist.empty or len(hist) < 20:
             return "HOLD"
-        closes = bars['close'].tolist()
+        closes = hist['Close'].tolist()
+        if len(closes) < 20:
+            return "HOLD"
         short_ma = sum(closes[-5:]) / 5
         long_ma = sum(closes[-20:]) / 20
         if short_ma > long_ma:
@@ -349,48 +374,92 @@ class HarveyController:
             self.current_hud.update_status(msg)
 
 # ========== SECTION: VOICE COMMANDS ==========
-recognizer = sr.Recognizer()
+def init_speech_recognition():
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold = 0.8
+    recognizer.operation_timeout = None
+    recognizer.phrase_threshold = 0.3
+    recognizer.non_speaking_duration = 0.8
+    
+    # List microphones and let you pick the right one
+    try:
+        mic_list = sr.Microphone.list_microphone_names()
+        print("\n=== Available microphones ===")
+        for idx, name in enumerate(mic_list):
+            print(f"{idx}: {name}")
+        print("=" * 40)
+    except Exception as e:
+        print(f"Error listing microphones: {e}")
+        mic_list = []
 
-# List microphones and let you pick the right one
-try:
-    mic_list = sr.Microphone.list_microphone_names()
-    print("Available microphones:")
-    for idx, name in enumerate(mic_list):
-        print(f"{idx}: {name}")
-except Exception as e:
-    print(f"Error listing microphones: {e}")
-    mic_list = []
+    # Try to find the best microphone
+    mic = None
+    MIC_INDEX = None
+    
+    # First try default microphone
+    try:
+        mic = sr.Microphone()
+        print("Using default microphone")
+    except Exception as e:
+        print(f"Error with default microphone: {e}")
+        
+        # Try to find a working microphone
+        if mic_list:
+            for idx in range(len(mic_list)):
+                try:
+                    test_mic = sr.Microphone(device_index=idx)
+                    # Test the microphone
+                    with test_mic as source:
+                        recognizer.adjust_for_ambient_noise(source, duration=0.1)
+                    mic = test_mic
+                    MIC_INDEX = idx
+                    print(f"Using microphone {idx}: {mic_list[idx]}")
+                    break
+                except Exception as mic_error:
+                    print(f"Microphone {idx} failed: {mic_error}")
+                    continue
+    
+    if not mic:
+        print("WARNING: No working microphone found!")
+        mic = sr.Microphone()  # Fallback
+    
+    return recognizer, mic
 
-# Set this to the index of your webcam mic (change if needed)
-MIC_INDEX = 0  # Change this to your webcam mic index after checking the printout above
-try:
-    mic = sr.Microphone(device_index=MIC_INDEX)
-except Exception as e:
-    print(f"Error initializing microphone: {e}")
-    mic = sr.Microphone()  # Use default microphone
-
+recognizer, mic = init_speech_recognition()
 wake_words = ["harvey", "wake up", "i'm home", "jarvis"]
 active_project = None
 
 def listen_for_command():
+    if not mic:
+        print("No microphone available")
+        return ""
+        
     try:
         with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.2)
-            print("Listening...")
+            print("Adjusting for ambient noise...")
+            recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            print("Listening... (speak now)")
+            
             try:
-                audio = recognizer.listen(source, timeout=5, phrase_time_limit=7)
+                # Increased timeout and phrase time limit
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
+                print("Audio captured, processing...")
             except sr.WaitTimeoutError:
-                print("Listening timed out.")
+                print("Listening timed out - no speech detected.")
                 return ""
+                
         try:
-            command = recognizer.recognize_google(audio).lower()
+            print("Recognizing speech...")
+            command = recognizer.recognize_google(audio, language='en-US').lower()
             print(f"[User]: {command}")
             return command
         except sr.UnknownValueError:
-            print("Could not understand audio.")
+            print("Could not understand audio - please speak clearly.")
             return ""
         except sr.RequestError as e:
-            print(f"[Voice Error]: {e}")
+            print(f"Google Speech Recognition error: {e}")
             return ""
     except Exception as e:
         print(f"Error in listen_for_command: {e}")
@@ -466,14 +535,23 @@ def launch_harvey():
     controller = HarveyController(root)
 
     def voice_loop():
+        print("Voice loop started. Say 'Harvey' to wake me up!")
+        speak("Harvey AI system online. Say Harvey to activate voice commands.")
+        
         while True:
             try:
                 cmd = listen_for_command()
-                if any(word in cmd for word in wake_words):
+                if cmd and any(word in cmd for word in wake_words):
                     speak("Yes sir?")
+                    print("Wake word detected! Listening for command...")
                     full_command = listen_for_command()
                     if full_command:
                         handle_command(full_command, controller)
+                    else:
+                        speak("I didn't catch that. Please try again.")
+                elif cmd:
+                    print(f"Heard: '{cmd}' but no wake word detected.")
+                time.sleep(0.1)  # Small delay to prevent excessive CPU usage
             except Exception as e:
                 print(f"Error in voice loop: {e}")
                 time.sleep(1)
